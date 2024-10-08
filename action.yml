@@ -1,4 +1,7 @@
 name: avaxia-extension-pipeline
+description: a avaxia pipeline to use
+color: red
+icon: activity
 permissions:
   id-token: write
   contents: read
