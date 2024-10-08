@@ -1,4 +1,4 @@
-name: avaxia-extension
+name: avaxia-extension-pipeline
 
 permissions:
   id-token: write
