@@ -1,4 +1,4 @@
-name: template-frontend
+name: avaxia-extension
 
 permissions:
   id-token: write
