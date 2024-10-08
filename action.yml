@@ -1,0 +1,229 @@
+name: template-frontend
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+  security-events: write
+
+on:
+  workflow_call:
+    secrets:
+      SONAR_TOKEN:
+        required: true
+      SONAR_HOST_URL:
+        required: true
+      AZURE_DEVOPS_EXT_PAT:
+        required: true
+      ACR_PASSWORD: 
+          required: true
+      GITHUBTOKEN:
+          required: true
+                   
+      
+      
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc*'
+    branches:
+      - main
+
+env:
+  AZURE_DEVOPS_EXT_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+
+
+jobs:
+ 
+  build:
+    runs-on: [ubuntu-latest]
+    environment: build
+    #needs: sonarqube
+
+    outputs:
+      az_subscription_id: ${{ steps.setenv.outputs.az_subscription_id }}
+      docker_tag: ${{ steps.setenv.outputs.docker_tag }}
+      environment: ${{ steps.setenv.outputs.environment }}
+      environment_display: ${{ steps.setenv.outputs.environment_display }}
+      release_repo: ${{ steps.setenv.outputs.release_repo }}
+      kustomize_folder: ${{ steps.setenv.outputs.kustomize_folder }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/github-script@v6
+        name: Set environment
+        id: setenv
+        env:
+          IS_DEV: ${{ github.ref_type == 'branch' && github.ref_name == 'main' }}
+          IS_STAGING: ${{ github.ref_type == 'tag' && contains(github.ref_name, '-rc') }}
+          IS_PROD: ${{ github.ref_type == 'tag' && !contains(github.ref_name, '-rc') }}
+        with:
+          script: |
+            const {
+              IS_DEV,
+              IS_STAGING,
+              IS_PROD,
+            } = process.env
+
+            const fs = require('node:fs')
+            let envVars = undefined
+            const varsObj = ${{ toJSON(vars) }}
+
+            /**
+             * Selects GitHub Variables with name suffixed (i.e: _DEV, _STG, _PRD) and ignore name prefixed with 'GHA_'.
+             */
+            selectVarsBy = (obj, envName) =>
+              Object.entries(obj)
+              .filter(([key, _]) => !key.startsWith('GHA_') && key.endsWith(envName))
+              .map(([key, val]) => [key.slice(0, -envName.length), val])
+
+            const stringToBool = (s) => s.toLowerCase() === "true"
+
+            if (stringToBool(IS_DEV)) {
+              core.setOutput("az_subscription_id", "${{ vars.GHA_AZ_SUBSCRIPTION_ID_DEV }}")
+              core.setOutput("environment", "development")
+              core.setOutput("environment_display", "Dev")
+              core.setOutput("release_repo", "${{ vars.GHA_RELEASE_REPO_DEV }}")
+              core.setOutput("kustomize_folder","${{ vars.GHA_PROJECT_REPO_DEV }}" )
+              core.setOutput("acr_name", "${{ vars.GHA_REGISTRY_NAME_DEV }}.${{ vars.GHA_REGISTRY_DOMAIN }}")
+              core.setOutput("docker_tag", `${{ vars.GHA_REGISTRY_NAME_DEV }}.${{ vars.GHA_REGISTRY_DOMAIN }}/${{ vars.GHA_IMAGE_NAME }}:${{ github.sha }}`)
+              envVars = selectVarsBy(varsObj, '_DEV')
+              console.log("set development environment")
+            } else if (stringToBool(IS_STAGING)) {
+              core.setOutput("az_subscription_id", "${{ vars.GHA_AZ_SUBSCRIPTION_ID_STG }}")
+              core.setOutput("environment", "staging")
+              core.setOutput("environment_display", "Staging")
+              core.setOutput("release_repo", "${{ vars.GHA_RELEASE_REPO_STG }}")
+              core.setOutput("kustomize_folder","${{ vars.GHA_PROJECT_REPO_STG}}" )
+              core.setOutput("acr_name", "${{ vars.GHA_REGISTRY_NAME_STG }}.${{ vars.GHA_REGISTRY_DOMAIN }}")
+              core.setOutput("docker_tag", `${{ vars.GHA_REGISTRY_NAME_STG }}.${{ vars.GHA_REGISTRY_DOMAIN }}/${{ vars.GHA_IMAGE_NAME }}:${{ github.ref_name }}`)
+              envVars = selectVarsBy(varsObj, '_STG')
+              console.log("set staging environment")
+            } else if (stringToBool(IS_PROD)) {
+              core.setOutput("az_subscription_id", "${{ vars.GHA_AZ_SUBSCRIPTION_ID_PRD }}")
+              core.setOutput("environment", "production")
+              core.setOutput("environment_display", "Production")
+              core.setOutput("release_repo", "${{ vars.GHA_RELEASE_REPO_PRD }}")
+              core.setOutput("kustomize_folder","${{ vars.GHA_PROJECT_REPO_PRD}}" )
+              core.setOutput("acr_name", "${{ vars.GHA_REGISTRY_NAME_PRD }}.${{ vars.GHA_REGISTRY_DOMAIN }}")
+              core.setOutput("docker_tag", `${{ vars.GHA_REGISTRY_NAME_PRD }}.${{ vars.GHA_REGISTRY_DOMAIN }}/${{ vars.GHA_IMAGE_NAME }}:${{ github.ref_name }}`)
+              envVars = selectVarsBy(varsObj, '_PRD')
+              console.log("set prod environment")
+            } else {
+              console.error("Unexcpected environment")
+              process.exit(1)
+            }
+
+            const mergedEntries = [ ...selectVarsBy(varsObj, '_GLOBAL'), ...envVars ]
+            const file = mergedEntries.map(o => o.join('=')).join('\n')
+            fs.writeFileSync('./.env', file, { encoding: 'utf8' })
+
+     
+      - name: Displays .env file
+        run: cat .env
+
+      - uses: actions/cache@v3
+        id: docker-cache
+        with:
+          path: |
+            /var/lib/docker
+          key: ${{ github.sha }}
+
+      - name: Install Azure CLI
+        run: |
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Azure CLI Version
+        run: |
+          az account clear
+          az version
+
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v1
+        with:
+              registry: ${{ steps.setenv.outputs.acr_name }}
+              username: ${{ vars.ACR_USERNAME }}
+              password: ${{ secrets.ACR_PASSWORD }}
+
+
+      #- name: Inject secret to .env file
+      #  run: |
+      #    echo -e "\nWSO2_CLIENT_CREDENTIALS=${{ steps.setenv.outputs.WSO2_CLIENT_CREDENTIALS }}" >> .env
+
+          
+      - name: Build Docker Image
+        id: docker_build
+        
+        run: |
+          docker build . -f ./Dockerfile  -t ${{ steps.setenv.outputs.docker_tag }} $(for i in `cat .env`; do out+="--build-arg $i " ; done; echo $out;out="")
+          
+      - name: Scan for vulnerabilities
+        id: scan
+        uses: crazy-max/ghaction-container-scan@v3
+        with:
+          image: ${{ steps.setenv.outputs.docker_tag }}
+          #severity_threshold: HIGH
+          dockerfile: ./Dockerfile
+          annotations: true
+          
+      # "Advanced Security must be enabled"--> entreprise version 
+      #- name: Upload SARIF file
+      #  if: ${{ steps.scan.outputs.sarif != '' }}
+      #  uses: github/codeql-action/upload-sarif@v2
+      #  with:
+      #    sarif_file: ${{ steps.scan.outputs.sarif }}
+
+      - name: Pushing Docker Image
+        id: docker_push
+        run: |
+          docker build . -f ./Dockerfile -t ${{ steps.setenv.outputs.docker_tag }} $(for i in `cat .env`; do out+="--build-arg $i " ; done; echo $out;out="")
+          docker push ${{ steps.setenv.outputs.docker_tag }}
+
+  request_deployment_approval:
+    if: ${{ (github.ref_type == 'tag' || github.ref_name == 'main') && needs.build.outputs.environment == 'production' }}
+    needs: ['build']
+    environment: 'build'
+    runs-on: [ubuntu-latest]
+    steps:
+      - uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUBTOKEN  }}
+          approvers: HasseneFliss
+          issue-title: ${{ steps.setenv.outputs.docker_tag }}
+          issue-body: ${{ steps.setenv.outputs.docker_tag }}
+
+
+  release:
+    runs-on: [ubuntu-latest]
+    needs: ['request_deployment_approval','build']
+    if: ${{ !failure() && !cancelled() }}
+    environment:
+      name: ${{ needs.build.outputs.environment }}
+    env:
+      GITHUB_SA_USER: avaxiagroup
+      GITHUB_SA_EMAIL: devops-team@avaxia-group.com
+    steps: 
+      - uses: actions/checkout@v3
+        with:
+          repository: ${{ needs.build.outputs.release_repo }}
+          ref: main
+          token: ${{ secrets.GITHUBTOKEN }}
+      - run: |
+          git config user.name "${{ env.GITHUB_SA_USER }}"
+          git config user.email "${{ env.GITHUB_SA_EMAIL }}"
+
+      - uses: imranismail/setup-kustomize@v2
+
+      - name: ${{ needs.build.outputs.environment_display }}
+        run: |
+          echo "Tag: ${{ needs.build.outputs.docker_tag }}"
+          kustomize edit set image ${{ needs.build.outputs.docker_tag }}
+          git add .
+          git commit -m "Pushing to ${{ needs.build.outputs.environment }} ${{ needs.build.outputs.docker_tag }}"
+          git push
+          ls -la
+
+        working-directory: ${{ needs.build.outputs.kustomize_folder }}
